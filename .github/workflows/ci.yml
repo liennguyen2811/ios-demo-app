@@ -1,0 +1,239 @@
+name: DemoShop CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_regression:
+        description: 'Run Appium regression tests'
+        required: false
+        default: 'true'
+        type: boolean
+
+env:
+  XCODE_VERSION: '16.0'
+  SIMULATOR_NAME: 'iPhone 16'
+  SIMULATOR_OS: '18.5'
+  BUNDLE_ID: 'com.demoshop.app'
+  SCHEME: 'DemoShop'
+  BUILD_DIR: 'build/DerivedData'
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # JOB 1: Unit Tests (fast, always runs)
+  # ─────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Run unit tests
+        run: |
+          xcodebuild test \
+            -project DemoShop.xcodeproj \
+            -scheme DemoShopTests \
+            -destination 'platform=iOS Simulator,name=${{ env.SIMULATOR_NAME }}' \
+            -resultBundlePath TestResults.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcpretty --report junit --output test-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          path: test-results.xml
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 2: Build & Deploy to Firebase App Distribution
+  # ─────────────────────────────────────────────────────────
+  build-and-deploy:
+    name: Build & Deploy
+    runs-on: macos-15
+    needs: unit-tests
+    outputs:
+      app_path: ${{ steps.build.outputs.app_path }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version
+        id: version
+        run: |
+          VERSION="1.0.${{ github.run_number }}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Build version: $VERSION"
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build for Simulator
+        id: build
+        run: |
+          xcodebuild build \
+            -project DemoShop.xcodeproj \
+            -scheme ${{ env.SCHEME }} \
+            -destination 'platform=iOS Simulator,name=${{ env.SIMULATOR_NAME }},OS=${{ env.SIMULATOR_OS }}' \
+            -configuration Debug \
+            -derivedDataPath ${{ env.BUILD_DIR }} \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            MARKETING_VERSION=${{ steps.version.outputs.version }} \
+            CODE_SIGNING_ALLOWED=NO
+
+          APP_PATH=$(find ${{ env.BUILD_DIR }} -name "DemoShop.app" -not -path "*/Intermediates*" | head -1)
+          echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
+          echo "Built: $APP_PATH"
+
+      - name: Zip simulator build
+        run: |
+          APP_PATH=$(find ${{ env.BUILD_DIR }} -name "DemoShop.app" -not -path "*/Intermediates*" | head -1)
+          cd "$(dirname "$APP_PATH")"
+          zip -r DemoShop-simulator.zip "DemoShop.app"
+          echo "Zipped simulator build"
+
+      - name: Upload simulator build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: demoshop-simulator-${{ steps.version.outputs.version }}
+          path: "${{ env.BUILD_DIR }}/Build/Products/Debug-iphonesimulator/DemoShop-simulator.zip"
+          retention-days: 14
+
+      - name: Deploy to Firebase App Distribution
+        if: github.ref == 'refs/heads/main'
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+        run: |
+          npm install -g firebase-tools
+
+          # For simulator builds, we distribute the zip as a custom artifact
+          # In production you'd distribute an IPA signed with Ad Hoc certificate
+          APP_PATH=$(find ${{ env.BUILD_DIR }} -name "DemoShop.app" -not -path "*/Intermediates*" | head -1)
+          ZIP_PATH="$(dirname "$APP_PATH")/DemoShop-simulator.zip"
+
+          firebase appdistribution:distribute "$ZIP_PATH" \
+            --app "$FIREBASE_APP_ID" \
+            --token "$FIREBASE_TOKEN" \
+            --release-notes "Build ${{ steps.version.outputs.version }} — commit ${{ github.sha }}" \
+            --groups "testers" || true
+
+          echo "Deployed to Firebase App Distribution"
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 3: Regression Tests (Appium)
+  # ─────────────────────────────────────────────────────────
+  regression-tests:
+    name: Appium Regression
+    runs-on: macos-15
+    needs: build-and-deploy
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download simulator build
+        uses: actions/download-artifact@v4
+        with:
+          name: demoshop-simulator-${{ needs.build-and-deploy.outputs.version }}
+          path: /tmp/demoshop-artifact
+
+      - name: Unzip app
+        run: |
+          cd /tmp/demoshop-artifact
+          unzip DemoShop-simulator.zip
+          ls -la
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Start Appium server
+        run: |
+          npm install -g appium
+          appium driver install xcuitest
+          appium --log /tmp/appium.log &
+          sleep 5
+          curl -s http://localhost:4723/status | python3 -c "import json,sys; print('Appium ready:', json.load(sys.stdin)['value']['ready'])"
+
+      - name: Boot iOS Simulator
+        run: |
+          UDID=$(xcrun simctl list devices | grep "${{ env.SIMULATOR_NAME }}" | grep -v unavailable | head -1 | grep -oE '[A-F0-9-]{36}')
+          xcrun simctl boot "$UDID" || true
+          open -a Simulator || true
+          sleep 5
+          echo "Simulator UDID: $UDID"
+          echo "SIM_UDID=$UDID" >> $GITHUB_ENV
+
+      - name: Checkout automation tests
+        uses: actions/checkout@v4
+        with:
+          repository: liennguyen2811/automation-demo
+          path: automation-demo
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Run Appium regression tests
+        working-directory: automation-demo
+        env:
+          APP_PATH: /tmp/demoshop-artifact/DemoShop.app
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          PLATFORM: ios
+          SIM_UDID: ${{ env.SIM_UDID }}
+        run: |
+          mvn test \
+            -Dtest="DemoShopLoginTest,DemoShopCartTest" \
+            -Dplatform=ios \
+            -Dapp.path="$APP_PATH" \
+            -Dudid="$SIM_UDID" \
+            --no-transfer-progress || true
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: appium-test-results
+          path: |
+            automation-demo/target/surefire-reports/
+            /tmp/appium.log
+
+      - name: Report to Jira
+        if: always()
+        env:
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          # Post build status as Jira comment to any open SCRUM tickets
+          STATUS="${{ job.status }}"
+          BUILD_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MESSAGE="*Regression Build #${{ github.run_number }} — ${STATUS^^}*\n\nBuild: ${BUILD_URL}\nCommit: ${{ github.sha }}\nPlatform: iOS Simulator"
+
+          AUTH=$(echo -n "$JIRA_EMAIL:$JIRA_API_TOKEN" | base64)
+          PAYLOAD=$(python3 -c "
+          import json, sys
+          msg = sys.argv[1]
+          print(json.dumps({'body': {'type': 'doc', 'version': 1, 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': msg}]}]}}))
+          " "$MESSAGE")
+
+          # Post to a summary ticket (or create one)
+          curl -s -X POST "$JIRA_URL/rest/api/3/issue/SCRUM-7/comment" \
+            -H "Authorization: Basic $AUTH" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" || true
+
+          echo "Jira notification sent"
