@@ -1,0 +1,43 @@
+name: DemoShop
+options:
+  bundleIdPrefix: com.demoshop
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "16.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+
+targets:
+  DemoShop:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: DemoShop
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.demoshop.app
+        INFOPLIST_FILE: DemoShop/Resources/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SWIFT_VERSION: "5.9"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGNING_ALLOWED: "NO"
+
+  DemoShopTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: DemoShopTests
+    dependencies:
+      - target: DemoShop
+    settings:
+      base:
+        SWIFT_VERSION: "5.9"
